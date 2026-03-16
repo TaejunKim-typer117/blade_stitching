@@ -56,8 +56,17 @@ def load_data(draft_dir):
 
     sections = defaultdict(list)
     for p in metadata['photos']:
-        key = f"{p['blade_tag']}-{p['blade_side_tag']}"
+        blade = p.get('blade_tag')
+        side = p.get('blade_side_tag')
+        if not blade or not side:
+            continue  # skip untagged
+        mission_uuid = p['metadata'].get('mission_uuid') or p['metadata'].get('missionUuid') or 'unknown'
+        key = f"{blade}-{side}-{mission_uuid}"
         sections[key].append(p['id'])
+
+    # Sort each section by increasing 'r' value
+    for key in sections:
+        sections[key].sort(key=lambda pid: photos_by_id[pid]['metadata'].get('r', 0))
 
     return metadata, photos_by_id, dict(sections)
 
@@ -128,8 +137,8 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
     panorama = stitch_trans_scale(images, transforms)
     print(f"Panorama shape: {panorama.shape}")
 
-    blade, side = section_name.split('-')
-    output_folder = os.path.join(output_dir, blade, side)
+    blade, side, mission_uuid = section_name.split('-', 2)
+    output_folder = os.path.join(output_dir, blade, side, mission_uuid)
     os.makedirs(output_folder, exist_ok=True)
     output_path = os.path.join(output_folder, 'panorama.jpg')
     cv2.imwrite(output_path, panorama, [cv2.IMWRITE_JPEG_QUALITY, 95])

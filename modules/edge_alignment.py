@@ -386,12 +386,12 @@ def compute_edge_aligned_transforms(images, masks, fallback_transforms):
         # Step 2: Scaling - align intersection points
         scale_factor = d_1 / d_2
 
-        # Skip scaling if factor is out of range
+        # Skip both translation and scaling if factor is out of range
         if scale_factor < 0.9 or scale_factor > 1.15:
             result['reason'] = f'scale factor out of range (sf={scale_factor:.4f})'
-            result['final_t'] = translated_t
-            print(f"  Pair {i}: +translation only (sf={scale_factor:.4f} out of [0.9, 1.15])")
-            aligned_transforms.append(translated_t)
+            result['translation_applied'] = False
+            print(f"  Pair {i}: fallback (sf={scale_factor:.4f} out of [0.9, 1.15])")
+            aligned_transforms.append(fallback_t)
             alignment_results.append(result)
             continue
 
