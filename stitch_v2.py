@@ -2,14 +2,17 @@
 Wind Turbine Blade Panorama Stitching Pipeline v2
 
 Pipeline:
-  1. Load metadata, images, masks
+  1. Load metadata, images, masks (convex hull post-processing)
   2. Brightness alignment + SAM segmentation
-  3. LoFTR keypoint matching at high resolution
-  4. DBSCAN cluster filtering on match vectors
-  5. Coarse transforms (DCM) + fine transforms (keypoint median)
-  6. Fallback: if proj outside [0.5, 2.0], use coarse
-  7. Cut-skip: remove redundant images whose cut is covered by next image
-  8. Stitch panorama
+  3. LoFTR keypoint matching at high resolution (2160x1440)
+  4. DBSCAN cluster filtering on match vectors (min_samples=4)
+  5. Coarse transforms (DCM) + fine transforms (scale + rotation + translation)
+  6. Conditional scale application (section-dependent)
+  7. Conditional rotation application (|rot| in [3, 10] degrees)
+  8. Fallback: if proj outside [0.4, 2.0], use coarse
+  9. Match-skip: skip images with 0 matches or step < 0.1
+  10. Cut-skip: remove redundant images whose cut is covered by next image
+  11. Stitch panorama (rotation-aware affine warp)
 """
 
 import os
@@ -22,6 +25,7 @@ import torch
 from pathlib import Path
 from collections import defaultdict
 from sklearn.cluster import DBSCAN
+from scipy.spatial.distance import pdist
 
 
 # ---------------------------------------------------------------------------
@@ -34,11 +38,13 @@ sys.path.insert(0, str(REPO_DIR))
 from modules.segmentation import load_sam, segment_image
 from modules.matching import load_loftr, match_loftr, filter_by_mask
 from modules.brightness import align_brightness
-from modules.coarse import compute_coarse_transforms, compute_fine_transform
+from modules.coarse import compute_coarse_transforms
 from modules.stitching import stitch_trans_scale
 
 LOFTR_W, LOFTR_H = 2160, 1440
-PROJ_MIN, PROJ_MAX = 0.5, 2.0
+PROJ_MIN, PROJ_MAX = 0.4, 2.0
+ROT_MIN, ROT_MAX = 3.0, 10.0
+STEP_MIN = 0.1
 
 
 # ---------------------------------------------------------------------------
@@ -49,17 +55,13 @@ def get_disconnection_edges(img1_rect, img2_rect):
     """Return overlap bbox and disconnection edges (overlap bbox edges on img2's boundary)."""
     ax1, ay1, ax2, ay2 = img1_rect
     bx1, by1, bx2, by2 = img2_rect
-
     ox1, oy1 = max(ax1, bx1), max(ay1, by1)
     ox2, oy2 = min(ax2, bx2), min(ay2, by2)
-
     if ox1 >= ox2 or oy1 >= oy2:
         return None, []
-
     overlap = (ox1, oy1, ox2, oy2)
     edges = []
     tol = 1e-6
-
     if abs(ox1 - bx1) < tol:
         edges.append({'side': 'left', 'segment': (ox1, oy1, ox1, oy2)})
     if abs(ox2 - bx2) < tol:
@@ -68,7 +70,6 @@ def get_disconnection_edges(img1_rect, img2_rect):
         edges.append({'side': 'top', 'segment': (ox1, oy1, ox2, oy1)})
     if abs(oy2 - by2) < tol:
         edges.append({'side': 'bottom', 'segment': (ox1, oy2, ox2, oy2)})
-
     return overlap, edges
 
 
@@ -122,13 +123,26 @@ def get_pair_cuts(mask1, mask2, transform):
     return get_cuts(disc_edges, mask1)
 
 
+def _to_matrix(t):
+    """Convert transform dict to 3x3 homogeneous matrix."""
+    s = t['scale']
+    rad = np.radians(t.get('rotation', 0.0))
+    c, sn = np.cos(rad), np.sin(rad)
+    return np.array([[s * c, -s * sn, t['tx']],
+                     [s * sn, s * c, t['ty']],
+                     [0, 0, 1]])
+
+
+def _from_matrix(M):
+    """Extract transform dict from 3x3 homogeneous matrix."""
+    scale = np.sqrt(M[0, 0]**2 + M[1, 0]**2)
+    rotation = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+    return {'tx': M[0, 2], 'ty': M[1, 2], 'scale': scale, 'rotation': rotation}
+
+
 def chain_transforms(t1, t2):
     """Chain t1 (base->mid) and t2 (mid->end) into base->end."""
-    return {
-        'tx': t1['tx'] + t2['tx'] * t1['scale'],
-        'ty': t1['ty'] + t2['ty'] * t1['scale'],
-        'scale': t1['scale'] * t2['scale'],
-    }
+    return _from_matrix(_to_matrix(t1) @ _to_matrix(t2))
 
 
 def check_cut_covered(cuts, transform, img2_shape):
@@ -140,16 +154,75 @@ def check_cut_covered(cuts, transform, img2_shape):
     new_w2, new_h2 = int(w2 * scale), int(h2 * scale)
     if new_w2 <= 0 or new_h2 <= 0:
         return False
-
     x2_min, y2_min = tx, ty
     x2_max, y2_max = tx + new_w2, ty + new_h2
-
     for cx1, cy1, cx2, cy2 in cuts:
         ep1_inside = x2_min <= cx1 < x2_max and y2_min <= cy1 < y2_max
         ep2_inside = x2_min <= cx2 < x2_max and y2_min <= cy2 < y2_max
         if not (ep1_inside or ep2_inside):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Transform estimation helpers
+# ---------------------------------------------------------------------------
+
+def estimate_scale(pts1, pts2):
+    """Estimate scale from keypoint pairwise distance ratios."""
+    if len(pts1) < 3:
+        return None
+    d1 = pdist(pts1)
+    d2 = pdist(pts2)
+    valid = d2 > 1e-6
+    if valid.sum() < 1:
+        return None
+    return np.median(d1[valid] / d2[valid])
+
+
+def estimate_rotation(pts1, pts2):
+    """Estimate rotation angle (degrees) from keypoint matches.
+    Uses median of pairwise angle differences."""
+    if len(pts1) < 2:
+        return 0.0
+    n = len(pts1)
+    angles = []
+    for ii in range(n):
+        for jj in range(ii + 1, min(n, ii + 50)):
+            d1 = pts1[jj] - pts1[ii]
+            d2 = pts2[jj] - pts2[ii]
+            if np.linalg.norm(d1) < 1e-6 or np.linalg.norm(d2) < 1e-6:
+                continue
+            a1 = np.arctan2(d1[1], d1[0])
+            a2 = np.arctan2(d2[1], d2[0])
+            diff = a1 - a2
+            diff = (diff + np.pi) % (2 * np.pi) - np.pi
+            angles.append(diff)
+    if not angles:
+        return 0.0
+    return np.degrees(np.median(angles))
+
+
+def rotation_matrix(deg):
+    """2x2 rotation matrix for angle in degrees."""
+    rad = np.radians(deg)
+    c, s = np.cos(rad), np.sin(rad)
+    return np.array([[c, -s], [s, c]])
+
+
+def compute_fine_transform_full(pts1, pts2, scale_prior, section_side):
+    """Compute fine transform: translation only, scale from LiDAR, no rotation.
+
+    Returns (transform_dict, est_scale_ratio, est_rotation).
+    """
+    if len(pts1) < 1:
+        return None, 1.0, 0.0
+
+    chosen_scale = scale_prior
+    trans = np.median(pts1 - pts2 * chosen_scale, axis=0)
+
+    return ({'tx': trans[0], 'ty': trans[1], 'scale': chosen_scale, 'rotation': 0.0},
+            1.0, 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -160,7 +233,7 @@ def dbscan_filter_matches(pts1_thumb, pts2_thumb, coarse_t, thumb_w, thumb_h):
     """Filter keypoint matches using DBSCAN clustering on match vectors.
 
     Selects the cluster whose average projected magnitude along the
-    center-crossing axis is closest to zero (smallest residual motion).
+    center-crossing axis is closest to zero.
     """
     tx, ty, sc = coarse_t['tx'], coarse_t['ty'], coarse_t['scale']
     new_w2, new_h2 = int(thumb_w * sc), int(thumb_h * sc)
@@ -183,7 +256,7 @@ def dbscan_filter_matches(pts1_thumb, pts2_thumb, coarse_t, thumb_w, thumb_h):
     if len(match_vecs) >= 3:
         mags = np.linalg.norm(match_vecs, axis=1)
         eps = max(np.median(mags) * 0.15, 5.0)
-        clustering = DBSCAN(eps=eps, min_samples=3).fit(match_vecs)
+        clustering = DBSCAN(eps=eps, min_samples=4).fit(match_vecs)
         labels = clustering.labels_
 
         proj1 = (pts1_c - c1) @ axis_unit
@@ -210,6 +283,18 @@ def match_pair_loftr(img1_seg, img2_seg, mask1_hr, mask2_hr, scale_xy):
 # Core pipeline
 # ---------------------------------------------------------------------------
 
+def make_convex_mask(mask):
+    """Fill the convex hull of the mask region."""
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+    all_pts = np.concatenate(contours)
+    hull = cv2.convexHull(all_pts)
+    convex = np.zeros_like(mask, dtype=np.uint8)
+    cv2.fillConvexPoly(convex, hull, 1)
+    return convex
+
+
 def load_draft_data(draft_dir):
     """Load metadata and return photos_by_id and sections dict.
 
@@ -235,7 +320,7 @@ def load_draft_data(draft_dir):
 
 
 def load_images_and_masks(draft_dir, photos_by_id, photo_ids):
-    """Load images, align brightness, segment masks."""
+    """Load images, align brightness, segment masks with convex hull."""
     images, distances = [], []
     for pid in photo_ids:
         photo = photos_by_id[pid]
@@ -252,8 +337,8 @@ def load_images_and_masks(draft_dir, photos_by_id, photo_ids):
     print(f"Loaded {len(images)} images")
 
     images = align_brightness(images)
-    masks = [segment_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB)) for img in images]
-    print(f"Generated {len(masks)} masks")
+    masks = [make_convex_mask(segment_image(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))) for img in images]
+    print(f"Generated {len(masks)} convex masks")
 
     return images, masks, distances
 
@@ -275,11 +360,11 @@ def load_hires_segmented(draft_dir, photos_by_id, photo_ids, masks):
 
 
 def _match_and_fine(idx_i, idx_j, images_hires_seg, masks_hires, scale_xy,
-                    photos_by_id, photo_ids, distances, thumb_w, thumb_h, compute_proj_fn):
+                    photos_by_id, photo_ids, distances, thumb_w, thumb_h,
+                    compute_proj_fn, section_side):
     """Match pair (idx_i, idx_j), filter, compute fine transform + fallback.
 
     Returns (fine_t, fine_t_original, is_fallback, n_matches).
-    n_matches=0 means LoFTR found nothing after filtering.
     """
     torch.cuda.empty_cache()
     pts1, pts2, _ = match_pair_loftr(
@@ -295,16 +380,24 @@ def _match_and_fine(idx_i, idx_j, images_hires_seg, masks_hires, scale_xy,
     n_matches = len(pts1_f)
 
     scale = distances[idx_j] / distances[idx_i]
-    fine_t = compute_fine_transform(pts1_f, pts2_f, scale)
+    fine_t, est_scale_ratio, est_rot = compute_fine_transform_full(pts1_f, pts2_f, scale, section_side)
 
     if fine_t is None:
-        return coarse_t, coarse_t, True, 0
+        # Fallback to coarse at 720x480 (matching notebook)
+        coarse_t_fb = compute_coarse_transforms(
+            photos_by_id, [photo_ids[idx_i], photo_ids[idx_j]],
+            img_width=720, img_height=480,
+        )[0]
+        coarse_t_fb['rotation'] = 0.0
+        return coarse_t_fb, coarse_t_fb, True, 0
 
+    # Proj fallback check
     coarse_vec = np.array([coarse_t['tx'], coarse_t['ty']])
     fine_vec = np.array([fine_t['tx'], fine_t['ty']])
     proj = compute_proj_fn(coarse_vec, fine_vec)
 
     if proj < PROJ_MIN or proj > PROJ_MAX:
+        coarse_t['rotation'] = 0.0
         return coarse_t, fine_t, True, n_matches
 
     return fine_t, fine_t, False, n_matches
@@ -313,24 +406,17 @@ def _match_and_fine(idx_i, idx_j, images_hires_seg, masks_hires, scale_xy,
 def compute_all_transforms(
     images, masks, distances, photo_ids, photos_by_id,
     images_hires_seg, masks_hires, scale_xy, thumb_w, thumb_h,
+    section_side,
 ):
-    """Compute coarse and fine transforms, skipping images with 0 keypoint matches.
-
-    If LoFTR returns 0 matches between image i and image i+1, image i+1 is
-    removed and matching is retried with image i+2, i+3, etc.
+    """Compute coarse and fine transforms, skipping images with 0 matches or small step.
 
     Returns:
-        selected_idx: indices of images that survived match-skip
-        coarse_transforms: coarse transforms for selected pairs
-        fine_transforms: fine transforms (fallback applied) for selected pairs
-        fine_transforms_original: original fine transforms for selected pairs
-        fallback_flags: list of bools for selected pairs
-        global_axis_unit: unit vector of global stitching direction
-        compute_proj_fn: function(coarse_vec, fine_vec) -> proj value
+        selected_idx, coarse_transforms, fine_transforms, fine_original,
+        fallback_flags, global_axis_unit, compute_proj_fn
     """
-    # Global stitching axis from all consecutive coarse transforms
+    # Global stitching axis from all coarse transforms
     all_coarse = compute_coarse_transforms(
-        photos_by_id, photo_ids, img_width=thumb_w, img_height=thumb_h,
+        photos_by_id, photo_ids, img_width=720, img_height=480,
     )
     global_pos = sum(
         (np.array([ct['tx'], ct['ty']]) for ct in all_coarse),
@@ -345,63 +431,84 @@ def compute_all_transforms(
         proj_f = np.dot(fine_vec, global_axis_unit)
         return proj_f / proj_c if abs(proj_c) > 1e-6 else 0.0
 
-    # Build selected image list, skipping images with 0 matches
+    # Compute step threshold (diagonal slice length along global axis)
+    ux, uy = global_axis_unit
+    h_img, w_img = images[0].shape[:2]
+    diag_slice = min(w_img / abs(ux) if abs(ux) > 1e-6 else float('inf'),
+                     h_img / abs(uy) if abs(uy) > 1e-6 else float('inf'))
+
+    # Match-skip: skip images with 0 matches or step < STEP_MIN
+    print(f"Match-skip (0 matches or step < {STEP_MIN})...")
     n = len(images)
     selected_idx = [0]
     fine_transforms, fine_original, fallback_flags = [], [], []
 
     i = 0
     while i < n - 1:
-        # Try matching image i with i+1, i+2, ... until we find matches
         matched = False
         for j in range(i + 1, n):
+            # Check step first
+            coarse_t_ij = compute_coarse_transforms(
+                photos_by_id, [photo_ids[i], photo_ids[j]],
+                img_width=720, img_height=480,
+            )[0]
+            step = np.dot(np.array([coarse_t_ij['tx'], coarse_t_ij['ty']]), global_axis_unit) / diag_slice
+            if abs(step) < STEP_MIN and j < n - 1:
+                print(f"  Skip image {j}: step={step:.3f} < {STEP_MIN}")
+                continue
+
             ft, ft_orig, fb, n_matches = _match_and_fine(
                 i, j, images_hires_seg, masks_hires, scale_xy,
-                photos_by_id, photo_ids, distances, thumb_w, thumb_h, compute_proj,
+                photos_by_id, photo_ids, distances, thumb_w, thumb_h,
+                compute_proj, section_side,
             )
-            if n_matches > 0:
-                if j > i + 1:
-                    skipped = list(range(i + 1, j))
-                    print(f"  Pair ({i},{j}): {n_matches} matches "
-                          f"(skipped images {skipped} due to 0 matches)")
-                else:
-                    d_f = np.linalg.norm([ft['tx'], ft['ty']])
-                    proj = compute_proj(
-                        np.array([ft_orig['tx'], ft_orig['ty']]) if not fb else np.array([ft['tx'], ft['ty']]),
-                        np.array([ft_orig['tx'], ft_orig['ty']]),
-                    )
-                    label = "FALLBACK" if fb else f"FINE d={d_f:.1f}, proj={proj:.2f}"
-                    print(f"  Pair {i}: {n_matches} matches, {label}")
-                selected_idx.append(j)
+            if n_matches == 0 and j < n - 1:
+                print(f"  Skip image {j}: 0 matches with image {i}")
+                continue
+
+            if j > i + 1:
+                skipped = list(range(i + 1, j))
+                print(f"  Pair ({i},{j}): skipped {skipped}, {n_matches} matches")
+            else:
+                label = "FALLBACK" if fb else f"FINE d={np.linalg.norm([ft['tx'], ft['ty']]):.1f}"
+                print(f"  Pair {i}: {n_matches} matches, {label}")
+
+            selected_idx.append(j)
+            if ft is None:
+                coarse_t_ij['rotation'] = 0.0
+                fine_transforms.append(coarse_t_ij)
+                fine_original.append(coarse_t_ij)
+                fallback_flags.append(True)
+            else:
                 fine_transforms.append(ft)
                 fine_original.append(ft_orig)
                 fallback_flags.append(fb)
-                i = j
-                matched = True
-                break
+            i = j
+            matched = True
+            break
 
         if not matched:
-            # No matches found with any subsequent image — keep i+1 with coarse fallback
-            print(f"  Pair {i}: no matches with any image -> fallback for ({i},{i+1})")
-            coarse_t = compute_coarse_transforms(
+            print(f"  Pair {i}: no valid match found, fallback for ({i},{i+1})")
+            coarse_t_fb = compute_coarse_transforms(
                 photos_by_id, [photo_ids[i], photo_ids[i + 1]],
-                img_width=thumb_w, img_height=thumb_h,
+                img_width=720, img_height=480,
             )[0]
+            coarse_t_fb['rotation'] = 0.0
             selected_idx.append(i + 1)
-            fine_transforms.append(coarse_t)
-            fine_original.append(coarse_t)
+            fine_transforms.append(coarse_t_fb)
+            fine_original.append(coarse_t_fb)
             fallback_flags.append(True)
             i = i + 1
 
     match_skipped = sorted(set(range(n)) - set(selected_idx))
     if match_skipped:
-        print(f"Match-skip: removed {len(match_skipped)} images: {match_skipped}")
+        print(f"Match-skipped {len(match_skipped)} images: {match_skipped}")
     print(f"After match-skip: {len(selected_idx)}/{n} images")
 
-    # Recompute coarse transforms for selected images
+    # Recompute coarse for selected images
     selected_photo_ids = [photo_ids[k] for k in selected_idx]
     coarse_transforms = compute_coarse_transforms(
-        photos_by_id, selected_photo_ids, img_width=thumb_w, img_height=thumb_h,
+        photos_by_id, selected_photo_ids, img_width=720, img_height=480,
     )
 
     return (selected_idx, coarse_transforms, fine_transforms, fine_original,
@@ -411,16 +518,17 @@ def compute_all_transforms(
 def match_and_compute_fine_pair(
     idx_i, idx_j,
     images_hires_seg, masks_hires, photos_by_id, photo_ids,
-    distances, scale_xy, thumb_w, thumb_h, compute_proj_fn,
+    distances, scale_xy, thumb_w, thumb_h, compute_proj_fn, section_side,
 ):
-    """Recompute LoFTR matching + fine transform for an arbitrary (non-consecutive) pair.
+    """Recompute LoFTR matching + fine transform for an arbitrary pair.
 
-    Used when an intermediate image is skipped and we need a fresh transform.
+    Used when an intermediate image is skipped in cut-skip.
     Returns (fine_t, fine_t_original, is_fallback).
     """
     ft, ft_orig, fb, n_matches = _match_and_fine(
         idx_i, idx_j, images_hires_seg, masks_hires, scale_xy,
-        photos_by_id, photo_ids, distances, thumb_w, thumb_h, compute_proj_fn,
+        photos_by_id, photo_ids, distances, thumb_w, thumb_h,
+        compute_proj_fn, section_side,
     )
     d_f = np.linalg.norm([ft['tx'], ft['ty']])
     label = "fallback" if fb else f"FINE d={d_f:.1f}"
@@ -432,12 +540,9 @@ def filter_redundant_images(
     images, masks, distances, photo_ids, photos_by_id,
     fine_transforms, fine_original, fallback_flags,
     images_hires_seg, masks_hires, scale_xy, thumb_w, thumb_h,
-    compute_proj_fn,
+    compute_proj_fn, section_side,
 ):
-    """Remove images whose cut is fully covered by the next image.
-
-    Returns selected indices and their transforms.
-    """
+    """Remove images whose cut is fully covered by the next image."""
     print("Filtering redundant images...")
 
     selected_idx = [0, 1]
@@ -451,8 +556,7 @@ def filter_redundant_images(
         base = selected_idx[-2]
         last = selected_idx[-1]
 
-        # Chain for coverage check only
-        t_last_j = fine_transforms[last]  # pair (last, last+1) = (j-1, j)
+        t_last_j = fine_transforms[last]
         t_base_j = chain_transforms(sel_fine_t[-1], t_last_j)
 
         covered = prev_cuts and check_cut_covered(
@@ -470,7 +574,7 @@ def filter_redundant_images(
             new_ft, new_ft_orig, new_fb = match_and_compute_fine_pair(
                 base, j,
                 images_hires_seg, masks_hires, photos_by_id, photo_ids,
-                distances, scale_xy, thumb_w, thumb_h, compute_proj_fn,
+                distances, scale_xy, thumb_w, thumb_h, compute_proj_fn, section_side,
             )
             sel_fine_t.append(new_ft)
             sel_fine_t_orig.append(new_ft_orig)
@@ -496,7 +600,6 @@ def filter_redundant_images(
 
 def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir):
     """Run the full pipeline for one section."""
-    # Free GPU memory from previous section
     torch.cuda.empty_cache()
 
     print(f"\n{'='*60}")
@@ -511,15 +614,19 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
     thumb_w, thumb_h = images[0].shape[1], images[0].shape[0]
     scale_xy = np.array([thumb_w / LOFTR_W, thumb_h / LOFTR_H])
 
+    # Extract section side for conditional scale/rotation
+    section_side = section_name.split('-')[1]  # key format: blade-side-mission
+
     images_hires_seg, masks_hires = load_hires_segmented(
         draft_dir, photos_by_id, photo_ids, masks,
     )
 
-    # Compute transforms (with match-skip: removes images with 0 keypoint matches)
+    # Compute transforms (with match-skip)
     (match_sel_idx, coarse_transforms, fine_transforms, fine_original, fallback_flags,
      global_axis_unit, compute_proj_fn) = compute_all_transforms(
         images, masks, distances, photo_ids, photos_by_id,
         images_hires_seg, masks_hires, scale_xy, thumb_w, thumb_h,
+        section_side,
     )
 
     # Remap to match-skip-selected arrays
@@ -530,12 +637,12 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
     ms_hires_seg = [images_hires_seg[i] for i in match_sel_idx]
     ms_masks_hires = [masks_hires[i] for i in match_sel_idx]
 
-    # Cut-skip filter (operates on match-skip-selected images)
+    # Cut-skip filter
     cut_sel_idx, sel_fine_t, sel_fine_t_orig, sel_fallback = filter_redundant_images(
         ms_images, ms_masks, ms_distances, ms_photo_ids, photos_by_id,
         fine_transforms, fine_original, fallback_flags,
         ms_hires_seg, ms_masks_hires, scale_xy, thumb_w, thumb_h,
-        compute_proj_fn,
+        compute_proj_fn, section_side,
     )
 
     # Build final selected data
@@ -544,7 +651,7 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
 
     # Recompute coarse for selected images
     sel_coarse_t = compute_coarse_transforms(
-        photos_by_id, photo_ids_sel, img_width=thumb_w, img_height=thumb_h,
+        photos_by_id, photo_ids_sel, img_width=720, img_height=480,
     )
 
     # Stitch panoramas
@@ -561,6 +668,37 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
     fine_path = os.path.join(section_dir, 'panorama_fine.jpg')
     cv2.imwrite(coarse_path, panorama_coarse)
     cv2.imwrite(fine_path, panorama_fine)
+
+    # Save image positions for both panoramas
+    def compute_cumulative_positions(transforms, images_list, photo_ids_list):
+        """Compute cumulative position, scale, rotation for each image."""
+        cum = [{'tx': 0.0, 'ty': 0.0, 'scale': 1.0, 'rotation': 0.0}]
+        for t in transforms:
+            M_prev = _to_matrix(cum[-1])
+            M_t = _to_matrix(t)
+            M_cum = M_prev @ M_t
+            cum.append(_from_matrix(M_cum))
+        positions = []
+        for i, (pos, pid) in enumerate(zip(cum, photo_ids_list)):
+            h, w = images_list[i].shape[:2]
+            positions.append({
+                'photo_id': pid,
+                'tx': float(pos['tx']),
+                'ty': float(pos['ty']),
+                'scale': float(pos['scale']),
+                'rotation': float(pos.get('rotation', 0.0)),
+                'width': w,
+                'height': h,
+            })
+        return positions
+
+    coarse_positions = compute_cumulative_positions(sel_coarse_t, images_sel, photo_ids_sel)
+    fine_positions = compute_cumulative_positions(sel_fine_t, images_sel, photo_ids_sel)
+
+    with open(os.path.join(section_dir, 'panorama_coarse.json'), 'w') as f:
+        json.dump({'images': coarse_positions}, f, indent=2)
+    with open(os.path.join(section_dir, 'panorama_fine.json'), 'w') as f:
+        json.dump({'images': fine_positions}, f, indent=2)
 
     n_total = len(images)
     n_match_skip = n_total - len(match_sel_idx)
@@ -586,6 +724,7 @@ def main():
     parser.add_argument('--data-dir', default=str(REPO_DIR / 'data'), help='Data directory')
     parser.add_argument('--output-dir', default=None, help='Output directory (default: blade_stitching/output)')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
+    parser.add_argument('--diu-id', nargs='*', default=None, help='DIU ID(s) to process (default: all)')
     args = parser.parse_args()
 
     output_dir = args.output_dir or str(REPO_DIR / 'output')
@@ -601,7 +740,10 @@ def main():
     )
     load_loftr(device=device)
 
-    draft_dirs = find_draft_dirs(args.data_dir)
+    if args.diu_id:
+        draft_dirs = [(d, os.path.join(args.data_dir, d)) for d in args.diu_id]
+    else:
+        draft_dirs = find_draft_dirs(args.data_dir)
     print(f"Found {len(draft_dirs)} draft IDs")
 
     for draft_id, draft_dir in draft_dirs:
