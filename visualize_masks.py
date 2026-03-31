@@ -93,7 +93,6 @@ def main():
     device = torch.device(args.device)
     weights_dir = REPO_DIR / 'weights'
     load_sam(
-        base_checkpoint=str(weights_dir / 'sam_vit_b_01ec64.pth'),
         finetune_checkpoint=str(weights_dir / 'best_model.pth'),
         device=device,
     )

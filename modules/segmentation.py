@@ -39,7 +39,7 @@ _sam_model = None
 _device = None
 
 
-def load_sam(base_checkpoint, finetune_checkpoint, device=None):
+def load_sam(finetune_checkpoint, device=None, base_checkpoint=None):
     global _sam_model, _device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -49,6 +49,16 @@ def load_sam(base_checkpoint, finetune_checkpoint, device=None):
     _sam_model.load_state_dict(ckpt['model_state_dict'])
     _sam_model.eval()
     print("SAM loaded")
+
+
+def free_sam():
+    """Free SAM model from GPU memory."""
+    global _sam_model
+    if _sam_model is not None:
+        del _sam_model
+        _sam_model = None
+        torch.cuda.empty_cache()
+        print("SAM freed")
 
 
 def postprocess_mask(mask, threshold=0.5, morph_kernel_size=5, smooth_kernel_size=5, fill_holes=True):

@@ -40,7 +40,7 @@ from scipy.spatial.distance import pdist
 REPO_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(REPO_DIR))
 
-from modules.segmentation import load_sam, segment_image, segment_images_batch
+from modules.segmentation import load_sam, free_sam, segment_image, segment_images_batch
 from modules.matching import load_loftr, match_loftr, filter_by_mask
 from modules.brightness import align_brightness
 from modules.coarse import CoarseStitcher, clamp_lidar_distances
@@ -396,8 +396,6 @@ def build_section_ctx(section_name, photo_ids, photos_by_id, draft_dir) -> Optio
     for pid in photo_ids:
         photo = photos_by_id[pid]
         img_path = os.path.join(draft_dir, photo['original_path'])
-        if not os.path.exists(img_path):
-            img_path = os.path.join(draft_dir, photo['local_path'])
         img_orig = cv2.imread(img_path)
         if img_orig is None:
             continue
@@ -419,6 +417,7 @@ def build_section_ctx(section_name, photo_ids, photos_by_id, draft_dir) -> Optio
     raw_masks = segment_images_batch([cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in images])
     masks = [make_convex_mask(m) if use_convex else m.astype(np.uint8) for m in raw_masks]
     print(f"Generated {len(masks)} masks (convex={use_convex}, side={section_side})")
+    free_sam()
 
     # Apply masks to hires images
     masks_hires = [cv2.resize(m.astype(np.uint8), (LOFTR_W, LOFTR_H)) for m in masks]
@@ -646,26 +645,72 @@ def cut_skip(ctx: SectionCtx, fine_transforms, fallback_flags, compute_proj_fn):
 # Main
 # ---------------------------------------------------------------------------
 
+def is_disconnected(positions):
+    """Check if the stitched photos form more than one connected component.
+
+    Two photos are connected if their bounding boxes overlap. Connectivity
+    is transitive (union-find). Returns True if there are 2+ components.
+    """
+    n = len(positions)
+    if n <= 1:
+        return False
+
+    # Compute bounding boxes: (x1, y1, x2, y2) for each photo
+    bboxes = []
+    for p in positions:
+        x1 = p['tx']
+        y1 = p['ty']
+        x2 = x1 + p['width'] * p['scale']
+        y2 = y1 + p['height'] * p['scale']
+        bboxes.append((x1, y1, x2, y2))
+
+    # Union-Find
+    parent = list(range(n))
+
+    def find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    def union(a, b):
+        a, b = find(a), find(b)
+        if a != b:
+            parent[a] = b
+
+    for i in range(n):
+        ax1, ay1, ax2, ay2 = bboxes[i]
+        for j in range(i + 1, n):
+            bx1, by1, bx2, by2 = bboxes[j]
+            if ax1 < bx2 and ax2 > bx1 and ay1 < by2 and ay2 > by1:
+                union(i, j)
+
+    num_components = len(set(find(i) for i in range(n)))
+    return num_components > 1
+
+
 def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir):
-    """Run the full pipeline for one section."""
+    """Run the full pipeline for one section, check for disconnected photos."""
     torch.cuda.empty_cache()
-    t_section_start = time.time()
 
     print(f"\n{'='*60}")
     print(f"Processing: {section_name}")
     print(f"{'='*60}")
 
-    t0 = time.time()
+    if len(photo_ids) <= 10:
+        print(f"  Disconnected: True (only {len(photo_ids)} images)")
+        return
+
     ctx = build_section_ctx(section_name, photo_ids, photos_by_id, draft_dir)
     if ctx is None:
         print(f"Skipping {section_name}: need at least 2 images")
         return
-    t_load = time.time() - t0
+
+    # Load LoFTR after SAM is freed
+    load_loftr()
 
     # Phase 1: Match-skip
-    t0 = time.time()
     match_sel_idx, fine_transforms, fallback_flags, global_axis_unit, compute_proj_fn = match_skip(ctx)
-    t_match_skip = time.time() - t0
 
     # Remap ctx to match-skip-selected images
     ms_ctx = SectionCtx(
@@ -685,118 +730,66 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
     ms_ctx.init_coarse()
 
     # Phase 2: Cut-skip
-    t0 = time.time()
     cut_sel_idx, sel_fine_t, sel_fallback = cut_skip(
         ms_ctx, fine_transforms, fallback_flags, compute_proj_fn,
     )
-    t_cut_skip = time.time() - t0
 
     # Build final data
     images_sel = [ms_ctx.images[i] for i in cut_sel_idx]
     photo_ids_sel = [ms_ctx.photo_ids[i] for i in cut_sel_idx]
-    sel_coarse_t = ms_ctx.coarse_transforms_for(cut_sel_idx)
 
-    # Stitch panoramas
-    t0 = time.time()
-    panorama_coarse = stitch_trans_scale(images_sel, sel_coarse_t)
+    # Check disconnection using fine transforms
+    fine_positions = compute_cumulative_positions(sel_fine_t, images_sel, photo_ids_sel)
+    disconnected = is_disconnected(fine_positions)
+    print(f"  Disconnected: {disconnected}")
+
+    # Save fine panorama
     panorama_fine = stitch_trans_scale(images_sel, sel_fine_t)
-    t_stitch = time.time() - t0
-
-    # Save outputs
     blade, side, mission_uuid = section_name.split('-', 2)
     section_dir = os.path.join(output_dir, blade, side, mission_uuid)
     os.makedirs(section_dir, exist_ok=True)
-
-    coarse_path = os.path.join(section_dir, 'panorama_coarse.jpg')
     fine_path = os.path.join(section_dir, 'panorama_fine.jpg')
-    cv2.imwrite(coarse_path, panorama_coarse)
     cv2.imwrite(fine_path, panorama_fine)
-
-    coarse_positions = compute_cumulative_positions(sel_coarse_t, images_sel, photo_ids_sel)
-    fine_positions = compute_cumulative_positions(sel_fine_t, images_sel, photo_ids_sel)
-
-    with open(os.path.join(section_dir, 'panorama_coarse.json'), 'w') as f:
-        json.dump({'images': coarse_positions}, f, indent=2)
-    with open(os.path.join(section_dir, 'panorama_fine.json'), 'w') as f:
-        json.dump({'images': fine_positions}, f, indent=2)
-
-    t_section_total = time.time() - t_section_start
-
-    n_total = len(ctx.images)
-    n_match_skip = n_total - len(match_sel_idx)
-    n_cut_skip = len(match_sel_idx) - len(images_sel)
-    print(f"\n  Panorama coarse: {panorama_coarse.shape} -> {coarse_path}")
-    print(f"  Panorama fine:   {panorama_fine.shape} -> {fine_path}")
-    print(f"  Total: {n_total}, Match-skipped: {n_match_skip}, Cut-skipped: {n_cut_skip}, "
-          f"Final: {len(images_sel)}, Fallback: {sum(sel_fallback)}/{len(sel_fallback)}")
-    print(f"  Timing: load+SAM+hires={t_load:.1f}s, match-skip={t_match_skip:.1f}s, "
-          f"cut-skip={t_cut_skip:.1f}s, stitch={t_stitch:.1f}s, total={t_section_total:.1f}s")
-
-
-def find_draft_dirs(data_dir):
-    """Find all subdirectories containing metadata.json."""
-    draft_dirs = []
-    for entry in sorted(os.listdir(data_dir)):
-        d = os.path.join(data_dir, entry)
-        if os.path.isdir(d) and os.path.exists(os.path.join(d, 'metadata.json')):
-            draft_dirs.append((entry, d))
-    return draft_dirs
+    print(f"  Panorama: {panorama_fine.shape} -> {fine_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Blade stitching pipeline v3')
+    parser = argparse.ArgumentParser(
+        description='Check disconnected photos in stitching',
+        usage='%(prog)s --diu-id ID --section BLADE/SIDE [options]',
+    )
     parser.add_argument('--data-dir', default=str(REPO_DIR / 'data'), help='Data directory')
-    parser.add_argument('--output-dir', default=None, help='Output directory (default: blade_stitching/output)')
+    parser.add_argument('--output-dir', '-o', default=None, help='Output directory (default: blade_stitching/output_disconnect)')
     parser.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu')
-    parser.add_argument('--diu-id', nargs='*', default=None, help='DIU ID(s) to process (default: all)')
-    parser.add_argument('--section', type=str, default=None, help='Section to process, e.g. A/LE (default: all)')
+    parser.add_argument('--diu-id', type=str, required=True, help='DIU ID to process')
+    parser.add_argument('--section', type=str, required=True, help='Section to process, e.g. A/LE')
     args = parser.parse_args()
 
-    output_dir = args.output_dir or str(REPO_DIR / 'output')
+    output_dir = args.output_dir or str(REPO_DIR / 'output_disconnect')
+    draft_dir = os.path.join(args.data_dir, args.diu_id)
     device = torch.device(args.device)
     print(f"Device: {device}")
+    print(f"DIU: {args.diu_id}, Section: {args.section}")
 
+    photos_by_id, sections = load_draft_data(draft_dir)
+
+    blade_f, side_f = args.section.split('/')
+    sections = {k: v for k, v in sections.items()
+                if k.startswith(f"{blade_f}-{side_f}-")}
+    if not sections:
+        print(f"No sections matching {args.section}")
+        return
+
+    # Load SAM first, LoFTR loaded later (after SAM is freed)
     weights_dir = REPO_DIR / 'weights'
     load_sam(
         finetune_checkpoint=str(weights_dir / 'best_model.pth'),
         device=device,
     )
-    load_loftr(device=device)
 
-    if args.diu_id:
-        draft_dirs = [(d, os.path.join(args.data_dir, d)) for d in args.diu_id]
-    else:
-        draft_dirs = find_draft_dirs(args.data_dir)
-    print(f"Found {len(draft_dirs)} draft IDs")
-
-    for draft_id, draft_dir in draft_dirs:
-        print(f"\n{'#'*60}")
-        print(f"Draft ID: {draft_id}")
-        print(f"{'#'*60}")
-
-        draft_output_dir = os.path.join(output_dir, draft_id)
-
-        try:
-            photos_by_id, sections = load_draft_data(draft_dir)
-            print(f"Sections: {list(sections.keys())}")
-
-            if args.section:
-                blade_f, side_f = args.section.split('/')
-                sections = {k: v for k, v in sections.items()
-                            if k.startswith(f"{blade_f}-{side_f}-")}
-                if not sections:
-                    print(f"No sections matching {args.section}")
-                    continue
-
-            for section_name, photo_ids in sections.items():
-                try:
-                    process_section(section_name, photo_ids, photos_by_id, draft_dir, draft_output_dir)
-                except Exception as e:
-                    print(f"Error processing {section_name}: {e}")
-                    import traceback
-                    traceback.print_exc()
-        except Exception as e:
-            print(f"Error loading {draft_id}: {e}")
+    for section_name, photo_ids in sections.items():
+        draft_output_dir = os.path.join(output_dir, args.diu_id)
+        process_section(section_name, photo_ids, photos_by_id, draft_dir, draft_output_dir)
 
     print("\nDone.")
 

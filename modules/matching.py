@@ -1,19 +1,26 @@
+from pathlib import Path
+
 import numpy as np
 import cv2
 import torch
 from kornia.feature import LoFTR
 
+WEIGHTS_DIR = Path(__file__).resolve().parent.parent / 'weights'
 
 _loftr = None
 _device = None
 
 
-def load_loftr(device=None):
+def load_loftr(checkpoint=None, device=None):
     global _loftr, _device
     if device is None:
         device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     _device = device
-    _loftr = LoFTR(pretrained='outdoor').to(device).eval()
+    if checkpoint is None:
+        checkpoint = str(WEIGHTS_DIR / 'loftr_outdoor.ckpt')
+    _loftr = LoFTR(pretrained=None).to(device)
+    _loftr.load_state_dict(torch.load(checkpoint, map_location=device)['state_dict'])
+    _loftr.eval()
     print("LoFTR loaded")
 
 
