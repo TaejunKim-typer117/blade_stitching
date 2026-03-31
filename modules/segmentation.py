@@ -74,8 +74,43 @@ def segment_image(img_rgb):
     img_resized = cv2.resize(img_rgb, (1024, 1024))
     img_norm = (img_resized / 255.0 - MEAN) / STD
     img_tensor = torch.from_numpy(img_norm.transpose(2, 0, 1)).float().unsqueeze(0).to(_device)
-    with torch.no_grad():
+    with torch.no_grad(), torch.cuda.amp.autocast():
         pred_mask, _ = _sam_model(img_tensor)
-        mask = torch.sigmoid(pred_mask).cpu().numpy()[0, 0]
+        mask = torch.sigmoid(pred_mask).float().cpu().numpy()[0, 0]
     mask = cv2.resize(mask, (w, h))
     return postprocess_mask(mask)
+
+
+def segment_images_batch(images_rgb, batch_size=4):
+    """Segment multiple images with batched encoder inference.
+
+    Args:
+        images_rgb: list of RGB numpy arrays (can be different sizes)
+        batch_size: number of images per encoder forward pass
+
+    Returns:
+        list of binary mask arrays (same sizes as inputs)
+    """
+    # Preprocess all images
+    orig_sizes = []
+    tensors = []
+    for img in images_rgb:
+        h, w = img.shape[:2]
+        orig_sizes.append((h, w))
+        img_resized = cv2.resize(img, (1024, 1024))
+        img_norm = (img_resized / 255.0 - MEAN) / STD
+        tensors.append(torch.from_numpy(img_norm.transpose(2, 0, 1)).float())
+
+    masks_out = []
+    for start in range(0, len(tensors), batch_size):
+        batch = torch.stack(tensors[start:start + batch_size]).to(_device)
+        with torch.no_grad(), torch.cuda.amp.autocast():
+            pred_masks, _ = _sam_model(batch)
+            pred_masks = torch.sigmoid(pred_masks).float().cpu().numpy()
+        for k in range(pred_masks.shape[0]):
+            idx = start + k
+            h, w = orig_sizes[idx]
+            mask = cv2.resize(pred_masks[k, 0], (w, h))
+            masks_out.append(postprocess_mask(mask))
+
+    return masks_out

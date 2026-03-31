@@ -4,6 +4,43 @@ import numpy as np
 import cv2
 
 
+# Camera specs matching create_stitching TypeScript implementation
+CAMERA_SPECS = {
+    'NWP': {'sensor_width': 35.9, 'focal_length': None},
+    'NWP2': {'sensor_width': 35.9, 'focal_length': None},
+    'DJI Air 2S': {'sensor_width': 13.05, 'focal_length': None},
+    'Mavic 3 Enterprise': {'sensor_width': 17.3, 'focal_length': 12.3},
+    'Mavic 3 EnterpriseW': {'sensor_width': 6.4, 'focal_length': 29.85},
+    'Mavic 3 Thermal': {'sensor_width': 6.4, 'focal_length': 4.4},
+    'Mavic 3 ThermalW': {'sensor_width': 6.4, 'focal_length': 29.85},
+}
+DEFAULT_DRONE_NAME = 'NWP'
+DEFAULT_FOCAL_LENGTH = 42
+NEW_META_VERSION = 0.9
+
+LIDAR_MIN = 2
+LIDAR_MAX = 40
+LIDAR_DEFAULT = 7
+
+
+def _get_camera_params(drone_name, focal_length_meta, blade_position=None):
+    """Get sensor width and focal length for a drone, matching create_stitching logic."""
+    # Wide-angle exception for Mavic 3 Enterprise/Thermal at bladePosition 0 or 2
+    if drone_name in ('Mavic 3 Enterprise', 'Mavic 3 Thermal') and blade_position in (0, 2):
+        drone_name = drone_name + 'W'
+    spec = CAMERA_SPECS.get(drone_name, CAMERA_SPECS[DEFAULT_DRONE_NAME])
+    sensor_width = spec['sensor_width']
+    focal_length = focal_length_meta or spec.get('focal_length') or DEFAULT_FOCAL_LENGTH
+    return sensor_width, focal_length
+
+
+def _clamp_lidar(distance, default=LIDAR_DEFAULT):
+    """Clamp LiDAR distance to valid range, matching create_stitching logic."""
+    if distance < LIDAR_MIN or distance > LIDAR_MAX:
+        return default
+    return distance
+
+
 def radians(degrees):
     return degrees * math.pi / 180
 
@@ -47,15 +84,30 @@ class CoarseStitcher:
         self.img_width = img_width
         self.img_height = img_height
 
-        sensor_width = 35.9
-        focal_length = 50.0
+        first_meta = photos_by_id[section_photo_ids[0]]['metadata']
+        drone = first_meta.get('drone', '')
+        focal_length_meta = first_meta.get('focal_length')
+        blade_position = first_meta.get('blade_position')
+
+        # Per-drone camera parameters (matching create_stitching)
+        sensor_width, focal_length = _get_camera_params(drone, focal_length_meta, blade_position)
         self.angle_width = math.atan2(sensor_width, focal_length * 2)
         self.angle_height = math.atan2(sensor_width * img_height / img_width, focal_length * 2)
 
-        first_meta = photos_by_id[section_photo_ids[0]]['metadata']
-        drone = first_meta.get('drone', '')
-        self.is_n1 = drone.startswith('NWP2')
-        self.is_mrc = drone.startswith('Mavic 3')
+        # MRC/N1 detection: check ANY image in section (matching create_stitching .some())
+        self.is_n1 = any(
+            float(photos_by_id[pid]['metadata'].get('meta_version', 0) or 0) >= NEW_META_VERSION
+            and (photos_by_id[pid]['metadata'].get('drone', '') or '').startswith('NWP2')
+            for pid in section_photo_ids
+        )
+        self.is_mrc = any(
+            float(photos_by_id[pid]['metadata'].get('meta_version', 0) or 0) >= NEW_META_VERSION
+            and (photos_by_id[pid]['metadata'].get('drone', '') or '').startswith('Mavic 3')
+            for pid in section_photo_ids
+        )
+
+        # Running default LiDAR distance (matching create_stitching)
+        self._default_lidar = LIDAR_DEFAULT
 
     def _calc_corner_points_in_gimbal(self, lidar_distance):
         tan_w = math.tan(self.angle_width)
@@ -113,8 +165,15 @@ class CoarseStitcher:
             dcm_curr_head_to_curr_gimbal.T
         )
 
-        curr_lidar = curr_meta.get('measured_distance_to_blade', 7.0)
-        next_lidar = next_meta.get('measured_distance_to_blade', 7.0)
+        curr_lidar = _clamp_lidar(
+            curr_meta.get('measured_distance_to_blade', LIDAR_DEFAULT),
+            self._default_lidar,
+        )
+        next_lidar_raw = next_meta.get('measured_distance_to_blade', LIDAR_DEFAULT)
+        next_lidar = _clamp_lidar(next_lidar_raw, self._default_lidar)
+        # Update running default with last valid value (matching create_stitching)
+        if LIDAR_MIN <= next_lidar_raw <= LIDAR_MAX:
+            self._default_lidar = next_lidar_raw
 
         curr_corners_gimbal = self._calc_corner_points_in_gimbal(curr_lidar)
         next_corners_gimbal = self._calc_corner_points_in_gimbal(next_lidar)
@@ -150,9 +209,26 @@ class CoarseStitcher:
         return positions
 
 
+def clamp_lidar_distances(photos_by_id, section_photo_ids):
+    """Clamp LiDAR distances with running default tracking (matching create_stitching).
+
+    Returns list of clamped distances in the same order as section_photo_ids.
+    """
+    default_lidar = LIDAR_DEFAULT
+    clamped = []
+    for pid in section_photo_ids:
+        raw = photos_by_id[pid]['metadata'].get('measured_distance_to_blade', LIDAR_DEFAULT)
+        val = _clamp_lidar(raw, default_lidar)
+        if LIDAR_MIN <= raw <= LIDAR_MAX:
+            default_lidar = raw
+        clamped.append(val)
+    return clamped
+
+
 def compute_coarse_transforms(photos_by_id, section_photo_ids, img_width=720, img_height=480):
     stitcher = CoarseStitcher(photos_by_id, section_photo_ids, img_width, img_height)
     positions = stitcher.compute_all_positions()
+    distances = clamp_lidar_distances(photos_by_id, section_photo_ids)
 
     transforms = []
     for i in range(len(section_photo_ids) - 1):
@@ -165,9 +241,7 @@ def compute_coarse_transforms(photos_by_id, section_photo_ids, img_width=720, im
         tx = next_pos[0] - curr_pos[0]
         ty = next_pos[1] - curr_pos[1]
 
-        curr_lidar = photos_by_id[curr_id]['metadata']['measured_distance_to_blade']
-        next_lidar = photos_by_id[next_id]['metadata']['measured_distance_to_blade']
-        scale = next_lidar / curr_lidar
+        scale = distances[i + 1] / distances[i]
 
         transforms.append({'tx': tx, 'ty': ty, 'scale': scale})
 

@@ -1,3 +1,6 @@
 data/*
 output/*
+output_*/
 weights/*
+log/*
+__pycache__

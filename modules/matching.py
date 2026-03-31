@@ -20,7 +20,7 @@ def load_loftr(device=None):
 def match_loftr(img1, img2):
     gray1 = torch.from_numpy(cv2.cvtColor(img1, cv2.COLOR_BGR2GRAY)).float()[None, None].to(_device) / 255.0
     gray2 = torch.from_numpy(cv2.cvtColor(img2, cv2.COLOR_BGR2GRAY)).float()[None, None].to(_device) / 255.0
-    with torch.no_grad():
+    with torch.no_grad(), torch.cuda.amp.autocast():
         result = _loftr({'image0': gray1, 'image1': gray2})
     return result['keypoints0'].cpu().numpy(), result['keypoints1'].cpu().numpy(), result['confidence'].cpu().numpy()
 
