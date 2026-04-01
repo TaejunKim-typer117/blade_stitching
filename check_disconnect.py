@@ -4,7 +4,7 @@ Wind Turbine Blade Panorama Stitching Pipeline v3
 Pipeline:
   1. Load original images, resize to working resolution (longer edge = 720)
   2. Brightness alignment + SAM segmentation (convex hull for PS/SS)
-  3. LoFTR keypoint matching at high resolution (2160x1440)
+  3. LoFTR keypoint matching at high resolution (longer edge = 1440)
   4. DBSCAN cluster filtering on match vectors
   5. Grid-based spatial sampling (5x5 grid, 25 samples) for transform estimation
   6. Fine transforms (scale + translation) with LiDAR scale prior
@@ -46,7 +46,7 @@ from modules.brightness import align_brightness
 from modules.coarse import CoarseStitcher, clamp_lidar_distances
 from modules.stitching import stitch_trans_scale
 
-LOFTR_W, LOFTR_H = 2160, 1440
+LOFTR_LONG_EDGE = 1440
 WORK_LONG_EDGE = 720
 PROJ_MIN, PROJ_MAX = 0.2, 2.0
 STEP_MIN = 0.1
@@ -400,7 +400,7 @@ def build_section_ctx(section_name, photo_ids, photos_by_id, draft_dir) -> Optio
         if img_orig is None:
             continue
         images.append(resize_long_edge(img_orig))
-        hires_seg.append(cv2.resize(img_orig, (LOFTR_W, LOFTR_H)))
+        hires_seg.append(resize_long_edge(img_orig, long_edge=LOFTR_LONG_EDGE))
         loaded_pids.append(pid)
 
     if len(images) < 2:
@@ -417,10 +417,10 @@ def build_section_ctx(section_name, photo_ids, photos_by_id, draft_dir) -> Optio
     raw_masks = segment_images_batch([cv2.cvtColor(img, cv2.COLOR_BGR2RGB) for img in images])
     masks = [make_convex_mask(m) if use_convex else m.astype(np.uint8) for m in raw_masks]
     print(f"Generated {len(masks)} masks (convex={use_convex}, side={section_side})")
-    free_sam()
 
     # Apply masks to hires images
-    masks_hires = [cv2.resize(m.astype(np.uint8), (LOFTR_W, LOFTR_H)) for m in masks]
+    loftr_h, loftr_w = hires_seg[0].shape[:2]
+    masks_hires = [cv2.resize(m.astype(np.uint8), (loftr_w, loftr_h)) for m in masks]
     for img_hr, mask_hr in zip(hires_seg, masks_hires):
         img_hr[mask_hr == 0] = 0
 
@@ -438,7 +438,7 @@ def build_section_ctx(section_name, photo_ids, photos_by_id, draft_dir) -> Optio
         masks_hires=masks_hires,
         thumb_w=thumb_w,
         thumb_h=thumb_h,
-        scale_xy=np.array([thumb_w / LOFTR_W, thumb_h / LOFTR_H]),
+        scale_xy=np.array([thumb_w / loftr_w, thumb_h / loftr_h]),
     )
     ctx.init_coarse()
     return ctx
@@ -706,9 +706,6 @@ def process_section(section_name, photo_ids, photos_by_id, draft_dir, output_dir
         print(f"Skipping {section_name}: need at least 2 images")
         return
 
-    # Load LoFTR after SAM is freed
-    load_loftr()
-
     # Phase 1: Match-skip
     match_sel_idx, fine_transforms, fallback_flags, global_axis_unit, compute_proj_fn = match_skip(ctx)
 
@@ -780,12 +777,12 @@ def main():
         print(f"No sections matching {args.section}")
         return
 
-    # Load SAM first, LoFTR loaded later (after SAM is freed)
     weights_dir = REPO_DIR / 'weights'
     load_sam(
         finetune_checkpoint=str(weights_dir / 'best_model.pth'),
         device=device,
     )
+    load_loftr(device=device)
 
     for section_name, photo_ids in sections.items():
         draft_output_dir = os.path.join(output_dir, args.diu_id)
